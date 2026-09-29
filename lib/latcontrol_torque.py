@@ -137,6 +137,7 @@ class LatControlTorque(LatControl):
     self._post_blinker_timer = 0.0   # 熄灯后抑制救急修正的剩余时间
     self._lc_hold_curvature = 0.0    # 延迟期内保持的车道保持曲率
     self._last_lane_correction = 0.0 # 救急修正低通滤波器状态
+    self._emergency_engaged = False  # 救急修正滞回状态（触发后需回落到更低下沿才释放）
     
     # Twilsonco的横向神经网络前馈
     self.use_nn = CI.has_lateral_torque_nn
@@ -311,34 +312,63 @@ class LatControlTorque(LatControl):
           else:
             diff = dist_right - dist_left
 
-          EMERGENCY_THRESHOLD = 0.45  # 45cm就开始救急（更早介入）
-          MAX_EMERGENCY_FORCE = 0.22  # 提高最大救急力度（更强响应）
+          # 车道线置信度门控（与 lane_planner.get_d_path 对齐：std>0.15 开始压、>0.3 压到 0）。
+          # 规划器不敢信的车道线，救急修正也不能信，否则两套控制器用两套输入打架（直行画龙主因）。
+          ll_conf = 0.0
+          if hasattr(model_data, 'laneLineProbs') and len(model_data.laneLineProbs) >= 3 and \
+             hasattr(model_data, 'laneLineStds') and len(model_data.laneLineStds) >= 3:
+            l_std_mod = interp(model_data.laneLineStds[1], [0.15, 0.3], [1.0, 0.0])
+            r_std_mod = interp(model_data.laneLineStds[2], [0.15, 0.3], [1.0, 0.0])
+            ll_conf = min(model_data.laneLineProbs[1] * l_std_mod,
+                          model_data.laneLineProbs[2] * r_std_mod)
 
-          if abs(diff) > EMERGENCY_THRESHOLD:
-            # 超过45cm就触发，线性增强到120cm封顶
-            overflow = min(abs(diff) - EMERGENCY_THRESHOLD, 0.75) / 0.75
+          EMERGENCY_THRESHOLD = 0.45  # 触发阈值（滞回上沿）：45cm 开始救急
+          EMERGENCY_RELEASE = 0.30    # 释放阈值（滞回下沿）：回落到 30cm 内才退出，防 bang-bang
+          MIN_LL_CONF = 0.4           # 置信度门限：低于此值不触发（车道线不可信）
+          MAX_EMERGENCY_FORCE = 0.22  # 最大救急力度
+
+          # 滞回：未触发态需超 45cm 才进，触发态回落到 30cm 内才退，消除边界来回切换
+          if self._emergency_engaged:
+            over_threshold = abs(diff) > EMERGENCY_RELEASE
+          else:
+            over_threshold = abs(diff) > EMERGENCY_THRESHOLD
+
+          if over_threshold and ll_conf > MIN_LL_CONF:
+            # 超过阈值就触发，线性增强到120cm封顶。
+            # max(·,0) 钳位：滞回态可停留在 30-45cm 释放带，此时 abs(diff)-0.45<0，
+            # 不钳位会让力度随 diff 变小而反向放大（把车往偏的方向继续推），
+            # 钳位后释放带内目标=0，修正力经同一低通对称衰减到 0。
+            overflow = max(0.0, min(abs(diff) - EMERGENCY_THRESHOLD, 0.75) / 0.75)
             raw_force = MAX_EMERGENCY_FORCE * overflow
 
             target_correction = math.copysign(raw_force, diff)
 
-            # 低通滤波：快速响应（提高alpha值）
-            FILTER_ALPHA = 0.15  # 从0.05提升到0.15，响应速度提升3倍
+            # 低通滤波：快速响应
+            FILTER_ALPHA = 0.15
 
             lane_centering_correction = FILTER_ALPHA * target_correction + (1 - FILTER_ALPHA) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
+            self._emergency_engaged = True
           else:
-            # 未超阈值时快速归零（提高收敛速度）
-            lane_centering_correction = 0.15 * (1 - 0.15) * self._last_lane_correction  # 从0.05提升到0.15
+            # 未超阈值/置信不足时归零：与触发低通对称的释放 (1-α)·last
+            # 注意：旧代码此处为 0.15*(1-0.15)=0.1275，释放被加速到 ~30ms 阶跃，
+            # 与触发侧 0.3s 爬升不对称，构成顿挫与振荡环路，现已修正为对称衰减。
+            lane_centering_correction = (1 - 0.15) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
-            if abs(lane_centering_correction) < 0.003:  # 降低归零阈值
+            self._emergency_engaged = False
+            if abs(lane_centering_correction) < 0.003:
               lane_centering_correction = 0.0
               self._last_lane_correction = 0.0
       elif lc_correction_suppressed:
         # 抑制期间清零滤波器状态，避免恢复时产生跳变
         self._last_lane_correction = 0.0
+        self._emergency_engaged = False
 
-      # 基础行驶意图（柔化）
-      desired_lateral_accel = desired_curvature * CS.vEgo ** 2 * 0.85
+      # 基础行驶意图：稳态目标 = κ·v² 满额（openpilot 原版行为）。
+      # 弯道跟线需要满额向心力；原 *0.85 造成稳态欠 15%，是"弯道往外漂"的根因。
+      # 柔化不靠缩幅值实现——desired_curvature 的变化率已在 get_lag_adjusted_curvature
+      # 被 MAX_LATERAL_JERK/v² 限制（横向加加速度 ≤5.0 m/s³），去掉 0.85 不引入阶跃过冲。
+      desired_lateral_accel = desired_curvature * CS.vEgo ** 2
 
       # 叠加车道居中修正（独立修正力，直道也有效！）
       desired_lateral_accel += lane_centering_correction

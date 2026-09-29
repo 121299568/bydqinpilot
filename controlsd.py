@@ -1171,7 +1171,12 @@ class Controls:
             if LEAD_EBRAKE_ENABLE and lead_one is not None and lead_one.status:
                 if lead_one.aLeadK < LEAD_EBRAKE_ACCEL_TH and 0.0 < lead_one.dRel < LEAD_EBRAKE_DIST_MAX_M:
                     d_rel_eb = max(lead_one.dRel, 0.1)
-                    ttc_eb = d_rel_eb / max(CS.vEgo, 0.1)   # 碰撞时间(s)，用自车速度估算
+                    # 碰撞时间(s)：分母用闭合速度(自车-前车速度)。
+                    # 此分支要求前车正在急刹(aLeadK<-3.0)，前车是运动的，
+                    # 用自车速度会把 TTC 算小 -> 高速跟车误触发全力刹。
+                    # 前车静止时 vLead≈0，闭合速度退化为 vEgo，与静态安全网行为一致。
+                    closing_speed_eb = max(CS.vEgo - lead_one.vLead, 0.1)
+                    ttc_eb = d_rel_eb / closing_speed_eb
                     if ttc_eb < LEAD_EBRAKE_TTC_S:
                         self._emergency_static = True
                         self._scene_flags['emergency_static'] = True
