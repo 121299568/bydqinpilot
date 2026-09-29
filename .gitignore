@@ -9,3 +9,20 @@ __pycache__/
 # build artifacts (keep .so: acados MPC solvers are runtime-required)
 *.o
 .DS_Store
+
+# backup / variant files (history lives in git, not in the worktree)
+*.bak
+*.bak_*
+*_bak*
+*.pybak
+*.orig
+*.orig_*
+*.py[0-9]*
+*.p
+*.tar.gz
+controlsd22.py
+*_old.py
+*_old/
+
+# local agent workspace (development notes, not part of the control stack)
+.workbuddy/
