@@ -1,0 +1,11 @@
+# original ignores
+calibration_param
+traces
+
+# python
+__pycache__/
+*.pyc
+
+# build artifacts (keep .so: acados MPC solvers are runtime-required)
+*.o
+.DS_Store
