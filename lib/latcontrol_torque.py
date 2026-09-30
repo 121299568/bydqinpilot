@@ -322,55 +322,37 @@ class LatControlTorque(LatControl):
             ll_conf = min(model_data.laneLineProbs[1] * l_std_mod,
                           model_data.laneLineProbs[2] * r_std_mod)
 
-          # P2-FIX：横向误差分级修正（文档要求：<0.2m 弱修正 / 中等渐增 / 大偏差强修正+纵向减速）
-          # 新增弱（15~25cm）和中（25~45cm）两档，与救急档（>45cm）累积叠加，全部经低通滤波平滑过渡。
-          WEAK_THRESHOLD = 0.15    # 弱修正触发阈值（文档要求 <0.2m）
-          WEAK_RELEASE = 0.10     # 弱修正释放阈值
-          MEDIUM_THRESHOLD = 0.25  # 中修正触发阈值
-          MEDIUM_RELEASE = 0.20    # 中修正释放阈值
-          EMERGENCY_THRESHOLD = 0.45  # 原救急阈值（不变）
-          EMERGENCY_RELEASE = 0.30
-          MIN_LL_CONF = 0.4
-          MAX_EMERGENCY_FORCE = 0.22  # 救急最大力度（不变）
-          MAX_MEDIUM_FORCE = 0.12    # P2-FIX：中等修正力度上限（60% of 救急）
-          MAX_WEAK_FORCE = 0.06      # P2-FIX：弱修正力度上限（30% of 救急）
+          EMERGENCY_THRESHOLD = 0.45  # 触发阈值（滞回上沿）：45cm 开始救急
+          EMERGENCY_RELEASE = 0.30    # 释放阈值（滞回下沿）：回落到 30cm 内才退出，防 bang-bang
+          MIN_LL_CONF = 0.4           # 置信度门限：低于此值不触发（车道线不可信）
+          MAX_EMERGENCY_FORCE = 0.22  # 最大救急力度
 
-          # 滞回状态机：判断当前是否处于"修正中"
-          # emergency 档独立滞回；weak/medium 档共用一个"非 emergency"状态
+          # 滞回：未触发态需超 45cm 才进，触发态回落到 30cm 内才退，消除边界来回切换
           if self._emergency_engaged:
-            in_emergency = abs(diff) > EMERGENCY_RELEASE   # 需跌至 30cm 内才退出救急
+            over_threshold = abs(diff) > EMERGENCY_RELEASE
           else:
-            in_emergency = abs(diff) > EMERGENCY_THRESHOLD  # 需超 45cm 才进救急
-          in_medium = abs(diff) > MEDIUM_THRESHOLD          # 中等修正：>25cm
-          in_weak = abs(diff) > WEAK_THRESHOLD              # 弱修正：>15cm
+            over_threshold = abs(diff) > EMERGENCY_THRESHOLD
 
-          if (in_weak or in_medium or in_emergency) and ll_conf > MIN_LL_CONF:
-            # 累积三档修正力：
-            # weak: 从 WEAK_THRESHOLD 爬到 MEDIUM_THRESHOLD（线性 0→MAX_WEAK_FORCE）
-            weak_force = 0.0
-            if in_weak and not in_medium and not in_emergency:
-              weak_force = MAX_WEAK_FORCE * (abs(diff) - WEAK_THRESHOLD) / (MEDIUM_THRESHOLD - WEAK_THRESHOLD)
-            elif in_weak:
-              weak_force = MAX_WEAK_FORCE
-            # medium: 从 MEDIUM_THRESHOLD 爬到 EMERGENCY_THRESHOLD（线性 0→MAX_MEDIUM_FORCE）
-            medium_force = 0.0
-            if in_medium and not in_emergency:
-              medium_force = MAX_MEDIUM_FORCE * (abs(diff) - MEDIUM_THRESHOLD) / (EMERGENCY_THRESHOLD - MEDIUM_THRESHOLD)
-            elif in_medium:
-              medium_force = MAX_MEDIUM_FORCE
-            # emergency: 从 EMERGENCY_THRESHOLD 爬到 120cm（保持原逻辑）
+          if over_threshold and ll_conf > MIN_LL_CONF:
+            # 超过阈值就触发，线性增强到120cm封顶。
+            # max(·,0) 钳位：滞回态可停留在 30-45cm 释放带，此时 abs(diff)-0.45<0，
+            # 不钳位会让力度随 diff 变小而反向放大（把车往偏的方向继续推），
+            # 钳位后释放带内目标=0，修正力经同一低通对称衰减到 0。
             overflow = max(0.0, min(abs(diff) - EMERGENCY_THRESHOLD, 0.75) / 0.75)
-            emergency_force = MAX_EMERGENCY_FORCE * overflow
-            # 三档求和（in_medium 但 !in_emergency 时 medium_force 已含 weak_force）
-            total_force = weak_force + medium_force + emergency_force
-            target_correction = math.copysign(total_force, diff)
+            raw_force = MAX_EMERGENCY_FORCE * overflow
 
+            target_correction = math.copysign(raw_force, diff)
+
+            # 低通滤波：快速响应
             FILTER_ALPHA = 0.15
+
             lane_centering_correction = FILTER_ALPHA * target_correction + (1 - FILTER_ALPHA) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
-            self._emergency_engaged = in_emergency  # 救急档才置 flag，弱/中档走 filter 衰减
+            self._emergency_engaged = True
           else:
-            # P2-FIX：释放时全部经低通对称衰减（不直接清 0），消除跳变顿挫
+            # 未超阈值/置信不足时归零：与触发低通对称的释放 (1-α)·last
+            # 注意：旧代码此处为 0.15*(1-0.15)=0.1275，释放被加速到 ~30ms 阶跃，
+            # 与触发侧 0.3s 爬升不对称，构成顿挫与振荡环路，现已修正为对称衰减。
             lane_centering_correction = (1 - 0.15) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
             self._emergency_engaged = False

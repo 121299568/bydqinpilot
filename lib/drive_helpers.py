@@ -211,33 +211,11 @@ def clip_curvature(v_ego, prev_curvature, new_curvature):
 
 def get_friction(lateral_accel_error: float, lateral_accel_deadzone: float, friction_threshold: float,
                  torque_params: car.CarParams.LateralTorqueTuning, friction_compensation: bool) -> float:
-  # P1-FIX: 硬死区在边界产生非连续跳变 → stick-slip 极限环振荡（画龙根因之一）。
-  # 改用三次埃尔米特样条做渐变过渡：
-  #   死区内：摩擦力二次平滑到 0（而非原硬截断的 0），保持静摩擦感；
-  #   边界处：f = f_threshold*0.2（而非 0），消除跳变；
-  #   死区外：同原线性插值。
-  # 关键保证：死区边界处 f 连续、一阶导数连续。
-  d = lateral_accel_deadzone
-  T = friction_threshold
-  e = lateral_accel_error
-  f_max = torque_params.friction
-
-  if abs(e) <= d:
-    # 死区内：二次平滑，f(±d) = f_max*0.2，f(0) = 0，一阶导数在 0 处为 0
-    t = abs(e) / max(d, 1e-9)
-    # 二次埃尔米特：f = f_max*0.2 * t²，在 t=1 处 = f_max*0.2，在 t=0 处 = 0
-    friction_magnitude = (f_max * 0.2) * (t * t)
-    friction_sign = 1.0 if e >= 0 else -1.0
-    friction_interp = friction_sign * friction_magnitude
-  else:
-    # 边界平滑：死区边界处 f = f_max*0.2，外推至 ±T 时满额
-    e_clipped = max(-T, min(e, T))
-    friction_interp = interp(
-      e_clipped,
-      [-T, -d, d, T],
-      [-f_max, -f_max * 0.2, f_max * 0.2, f_max]
-    )
-
+  friction_interp = interp(
+    apply_center_deadzone(lateral_accel_error, lateral_accel_deadzone),
+    [-friction_threshold, friction_threshold],
+    [-torque_params.friction, torque_params.friction]
+  )
   friction = float(friction_interp) if friction_compensation else 0.0
   return friction
 
