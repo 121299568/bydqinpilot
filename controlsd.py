@@ -92,7 +92,10 @@ CV_STEP = 8.0                # 单帧最大减速（m/s）
 # 比旧固定 0.1 km/h/帧 (=10km/h/s) 恢复快 2~5 倍：60km/h gap 从 6s 缩到约 1.2s 回到 v_cruise_before_curve。
 CV_REC_MIN  = 0.2           # 基础恢复步长 (km/h/帧)
 CV_REC_GAIN = 0.03          # 恢复步长随 gap 增长的系数 (km/h 每 km/h gap)
-CV_REC_MAX  = 0.5           # 恢复步长上限 (km/h/帧)，保护油门平滑
+CV_REC_MAX  = 0.2           # 恢复步长上限 (km/h/帧)，保护油门平滑
+                                # P0-FIX: 原 0.5 → 0.2，恢复速率 50→8 km/h/s，
+                                # 比率从 27x 缩到 ~4x，cruise 猛跳 vs vehicle 1.8km/h/s
+                                # 的 rubber-band 消除，gap 20km/h 约 7s 平滑收敛（人类习惯 6~10s）
 
 # ===== 视觉前车检测 =====
 VL_PROB = 0.6          # 视觉前车置信度阈值（0~1），越高越严格
@@ -870,7 +873,12 @@ class Controls:
     def _determine_accel_limits(self):
     # 根据场景标志位组合确定加速度限制
         flags = self._scene_flags
-    
+
+        # P2-FIX: 变道中（preparing + executing）收紧加速度限制，禁急加减速（文档场景4要求）
+        # 变道期间纵向加减速过大会造成"推头感"和"俯仰感"，分散驾驶员对横向控制的注意力
+        if self.sm['lateralPlan'].laneChangeState in (LaneChangeState.preLaneChange, LaneChangeState.laneChangeStarting):
+            return 0.3, -2.5   # 收紧正限：0.5→0.3；维持正常刹停：-2.5
+
         if flags['emergency_static']:
             return AC_SL_MAX, AC_EMERGENCY_MIN     # 紧急静态前车：强制最大减速度
         elif flags['stopped_lead']:
@@ -1023,7 +1031,10 @@ class Controls:
                         is_dangerous = rel_speed > VL_DANGER_KPH
                         if is_stopped or (is_close or is_dangerous):
                             current_lead_status = True
-                            self.experimental_mode = True
+                            # P1-FIX: 弯道场景下禁止前车检测覆盖 experimental_mode，
+                            # 否则弯道限速被 E2E 前车检测绕过（弯道+前车 → experimental_mode=True → 弯道减速失效）
+                            if not self._scene_flags.get('curve', False):
+                                self.experimental_mode = True
                             if is_stopped:
                                 # 静止确认：连续 VL_STOP_CONFIRM_T 秒才点亮，防模型单帧噪声误触发；
                                 # 雷达 is_radar_stopped 并行兜底，0.15s 延迟不伤急刹及时性。
@@ -1063,6 +1074,35 @@ class Controls:
                             self._scene_flags['high_speed_approach'] = True
                             self.experimental_mode = True
                             current_lead_status = True
+                        # P3-FIX: 前车预判多级减速（文档要求：不要等前车减速之后才刹车，提前预判）
+                        # 根据"自车相对前车快多少"分级，预判前车在减速，提前平缓降速。
+                        # 不依赖 aLeadK（vision lead 无该字段），用"自车明显快于前车"代理急刹。
+                        elif not hsa_triggered and not is_stopped and not is_close and not is_dangerous:
+                            # 用 speed_gap 作为前车在减速的代理指标（自车比前车快越多，相对减速越大）
+                            speed_gap_kph = v_ego_kph - v_vision_lead_kph
+                            if speed_gap_kph > 15.0:  # P3-3级：自车比前车快 >15km/h → 预判强减速
+                                if current_lead_status or not self._scene_flags.get('curve', False):
+                                    self.experimental_mode = True
+                                    current_lead_status = True
+                                self.v_cruise_helper.v_cruise_kph = min(
+                                    self.v_cruise_helper.v_cruise_kph,
+                                    max(v_vision_lead_kph + 5.0, self.v_cruise_helper.v_cruise_kph - 20.0)
+                                )
+                            elif speed_gap_kph > 10.0:  # P3-2级：自车比前车快 >10km/h → 预判中减速
+                                if current_lead_status or not self._scene_flags.get('curve', False):
+                                    self.experimental_mode = True
+                                    current_lead_status = True
+                                self.v_cruise_helper.v_cruise_kph = min(
+                                    self.v_cruise_helper.v_cruise_kph,
+                                    max(v_vision_lead_kph + 10.0, self.v_cruise_helper.v_cruise_kph - 15.0)
+                                )
+                            elif speed_gap_kph > 5.0:  # P3-1级：自车比前车快 >5km/h → 预判弱减速
+                                if not self._scene_flags.get('curve', False):
+                                    self.experimental_mode = True
+                                self.v_cruise_helper.v_cruise_kph = min(
+                                    self.v_cruise_helper.v_cruise_kph,
+                                    self.v_cruise_helper.v_cruise_kph - 8.0
+                                )
                         elif not other_scene_active and not self._op_long_takeover:
                             self.experimental_mode = False
                             if not is_stopped:
