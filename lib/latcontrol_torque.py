@@ -326,6 +326,12 @@ class LatControlTorque(LatControl):
           EMERGENCY_RELEASE = 0.30    # 释放阈值（滞回下沿）：回落到 30cm 内才退出，防 bang-bang
           MIN_LL_CONF = 0.4           # 置信度门限：低于此值不触发（车道线不可信）
           MAX_EMERGENCY_FORCE = 0.22  # 最大救急力度
+          WEAK_THRESHOLD = 0.15       # P2-WEAK 触发阈值：15cm 开始弱修正
+          WEAK_RELEASE = 0.10         # P2-WEAK 释放阈值：回落到 10cm 内才退出
+          MAX_WEAK_FORCE = 0.06       # P2-WEAK 最大弱修正力度
+          MEDIUM_THRESHOLD = 0.25     # P2-MEDIUM 触发阈值：25cm 开始中修正
+          MEDIUM_RELEASE = 0.18       # P2-MEDIUM 释放阈值：回落到 18cm 内才退出
+          MAX_MEDIUM_FORCE = 0.12     # P2-MEDIUM 最大中修正力度
 
           # 滞回：未触发态需超 45cm 才进，触发态回落到 30cm 内才退，消除边界来回切换
           if self._emergency_engaged:
@@ -344,7 +350,7 @@ class LatControlTorque(LatControl):
             target_correction = math.copysign(raw_force, diff)
 
             # 低通滤波：快速响应
-            FILTER_ALPHA = 0.15
+            FILTER_ALPHA = 0.20
 
             lane_centering_correction = FILTER_ALPHA * target_correction + (1 - FILTER_ALPHA) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
@@ -353,7 +359,7 @@ class LatControlTorque(LatControl):
             # 未超阈值/置信不足时归零：与触发低通对称的释放 (1-α)·last
             # 注意：旧代码此处为 0.15*(1-0.15)=0.1275，释放被加速到 ~30ms 阶跃，
             # 与触发侧 0.3s 爬升不对称，构成顿挫与振荡环路，现已修正为对称衰减。
-            lane_centering_correction = (1 - 0.15) * self._last_lane_correction
+            lane_centering_correction = (1 - 0.20) * self._last_lane_correction
             self._last_lane_correction = lane_centering_correction
             self._emergency_engaged = False
             if abs(lane_centering_correction) < 0.003:
