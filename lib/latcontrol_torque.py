@@ -391,6 +391,15 @@ class LatControlTorque(LatControl):
       # 叠加车道居中修正（独立修正力，直道也有效！）
       desired_lateral_accel += lane_centering_correction
 
+      # P3-FIX: 速度自适应横向软衰减（文档通用规则：低曲率直道减小增益，容忍小幅偏差）
+      # 高车速时同样 curvature 产生更大的 a_lat，体感压力增大。
+      # 用 sigmoid 形状软衰减：60km/h → 0.90，120km/h → 0.68，保留≥0.68 不影响弯道动力。
+      # 注意：此衰减作用于 desired_lateral_accel 总目标（含曲率+correction）；
+      # 弯道自身的安全减速和曲率限制不受此影响。
+      v_ego_kph = CS.vEgo * 3.6
+      decay = 1.0 / (1.0 + (v_ego_kph / 80.0) ** 1.5)   # 80km/h 时 ≈0.71，120km/h 时 ≈0.47
+      desired_lateral_accel *= max(0.70, decay)          # 保留≥70%，保护弯道动力
+
       # desired rate is the desired rate of change in the setpoint, not the absolute desired curvature
       # desired_lateral_jerk = desired_curvature_rate * CS.vEgo ** 2
       actual_lateral_accel = actual_curvature * CS.vEgo ** 2
